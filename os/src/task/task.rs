@@ -68,6 +68,11 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Relative CPU share used by the stride scheduler.
+    pub(crate) priority: usize,
+    /// Accumulated stride used to pick the next runnable process.
+    pub(crate) stride: u128,
 }
 
 impl TaskControlBlockInner {
@@ -116,6 +121,8 @@ impl TaskControlBlock {
                     parent: None,
                     children: Vec::new(),
                     exit_code: 0,
+                    priority: 16,
+                    stride: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
                 })
@@ -189,6 +196,8 @@ impl TaskControlBlock {
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
                     exit_code: 0,
+                    priority: 16,
+                    stride: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
                 })
