@@ -40,6 +40,7 @@ pub fn kernel_token() -> usize {
 pub struct MemorySet {
     page_table: PageTable,
     areas: Vec<MapArea>,
+    mmap_frames: BTreeMap<VirtPageNum, FrameTracker>,
 }
 
 impl MemorySet {
@@ -48,6 +49,7 @@ impl MemorySet {
         Self {
             page_table: PageTable::new(),
             areas: Vec::new(),
+            mmap_frames: BTreeMap::new(),
         }
     }
     /// Get the page table token
@@ -269,6 +271,14 @@ impl MemorySet {
                     .copy_from_slice(src_ppn.get_bytes_array());
             }
         }
+        // Clone anonymous pages so the child can modify its own copy.
+        for (&vpn, source) in &user_space.mmap_frames {
+            let pte = user_space.page_table.translate(vpn).unwrap();
+            let frame = frame_alloc().unwrap();
+            frame.ppn.get_bytes_array().copy_from_slice(source.ppn.get_bytes_array());
+            memory_set.page_table.map(vpn, frame.ppn, pte.flags());
+            memory_set.mmap_frames.insert(vpn, frame);
+        }
         memory_set
     }
     /// Change page table by writing satp CSR Register.
@@ -284,9 +294,70 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
-    ///Remove all `MapArea`
+    /// Recycle the process's data pages.
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();
+        for &vpn in self.mmap_frames.keys() {
+            self.page_table.unmap(vpn);
+        }
+        self.mmap_frames.clear();
+    }
+
+    // ChatGPT assisted with adapting the ch4 mmap implementation to ch5.
+    /// Map zeroed user pages after checking the entire range for conflicts.
+    pub(crate) fn mmap(&mut self, start: usize, len: usize, prot: usize) -> bool {
+        if prot == 0 || prot & !0b111 != 0 {
+            return false;
+        }
+        let Some(range) = Self::mmap_range(start, len) else {
+            return false;
+        };
+        if range.into_iter().any(|vpn| {
+            self.page_table.translate(vpn).map_or(false, |pte| pte.is_valid())
+        }) {
+            return false;
+        }
+
+        let flags = PTEFlags::from_bits((prot as u8) << 1).unwrap() | PTEFlags::U;
+        let mut frames = BTreeMap::new();
+        for vpn in range {
+            let Some(frame) = frame_alloc() else {
+                return false;
+            };
+            frames.insert(vpn, frame);
+        }
+        for (vpn, frame) in &frames {
+            self.page_table.map(*vpn, frame.ppn, flags);
+        }
+        self.mmap_frames.append(&mut frames);
+        true
+    }
+
+    /// Unmap user pages previously allocated by mmap.
+    pub(crate) fn munmap(&mut self, start: usize, len: usize) -> bool {
+        let Some(range) = Self::mmap_range(start, len) else {
+            return false;
+        };
+        if range.into_iter().any(|vpn| !self.mmap_frames.contains_key(&vpn)) {
+            return false;
+        }
+        for vpn in range {
+            self.page_table.unmap(vpn);
+            self.mmap_frames.remove(&vpn);
+        }
+        true
+    }
+
+    fn mmap_range(start: usize, len: usize) -> Option<VPNRange> {
+        const USER_END: usize = 1usize << 38;
+        let end = start.checked_add(len)?;
+        if start % PAGE_SIZE != 0 || start >= USER_END || end > USER_END {
+            return None;
+        }
+        Some(VPNRange::new(
+            VirtAddr::from(start).floor(),
+            VirtAddr::from(end).ceil(),
+        ))
     }
 
     /// shrink the area to new_end
@@ -312,7 +383,14 @@ impl MemorySet {
             .iter_mut()
             .find(|area| area.vpn_range.get_start() == start.floor())
         {
-            area.append_to(&mut self.page_table, new_end.ceil());
+            let old_end = area.vpn_range.get_end();
+            let new_end = new_end.ceil();
+            if new_end < old_end || VPNRange::new(old_end, new_end).into_iter().any(|vpn| {
+                self.page_table.translate(vpn).map_or(false, |pte| pte.is_valid())
+            }) {
+                return false;
+            }
+            area.append_to(&mut self.page_table, new_end);
             true
         } else {
             false
