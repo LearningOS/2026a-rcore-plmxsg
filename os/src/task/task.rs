@@ -28,6 +28,7 @@ pub struct TaskControlBlock {
 
     /// Program break
     pub program_brk: usize,
+    pub(super) syscall_counts: [usize; super::SYSCALL_COUNT_LIMIT],
 }
 
 impl TaskControlBlock {
@@ -63,6 +64,7 @@ impl TaskControlBlock {
             base_size: user_sp,
             heap_bottom: user_sp,
             program_brk: user_sp,
+            syscall_counts: [0; super::SYSCALL_COUNT_LIMIT],
         };
         // prepare TrapContext in user space
         let trap_cx = task_control_block.get_trap_cx();

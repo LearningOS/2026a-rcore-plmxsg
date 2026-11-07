@@ -37,6 +37,7 @@ lazy_static! {
 pub struct MemorySet {
     page_table: PageTable,
     areas: Vec<MapArea>,
+    mmap_frames: BTreeMap<VirtPageNum, FrameTracker>,
 }
 
 impl MemorySet {
@@ -45,6 +46,7 @@ impl MemorySet {
         Self {
             page_table: PageTable::new(),
             areas: Vec::new(),
+            mmap_frames: BTreeMap::new(),
         }
     }
     /// Get the page table token
@@ -233,6 +235,62 @@ impl MemorySet {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
     }
+    /// Map zeroed user pages after checking the entire range for conflicts.
+    pub(crate) fn mmap(&mut self, start: usize, len: usize, prot: usize) -> bool {
+        if prot == 0 || prot & !0b111 != 0 {
+            return false;
+        }
+        let Some(range) = Self::mmap_range(start, len) else {
+            return false;
+        };
+        if range.into_iter().any(|vpn| {
+            self.page_table.translate(vpn).map_or(false, |pte| pte.is_valid())
+        }) {
+            return false;
+        }
+
+        let flags = PTEFlags::from_bits((prot as u8) << 1).unwrap() | PTEFlags::U;
+        let mut frames = BTreeMap::new();
+        for vpn in range {
+            let Some(frame) = frame_alloc() else {
+                return false;
+            };
+            frames.insert(vpn, frame);
+        }
+        for (vpn, frame) in &frames {
+            self.page_table.map(*vpn, frame.ppn, flags);
+        }
+        self.mmap_frames.append(&mut frames);
+        true
+    }
+
+    /// Unmap user pages previously allocated by mmap.
+    pub(crate) fn munmap(&mut self, start: usize, len: usize) -> bool {
+        let Some(range) = Self::mmap_range(start, len) else {
+            return false;
+        };
+        if range.into_iter().any(|vpn| !self.mmap_frames.contains_key(&vpn)) {
+            return false;
+        }
+        for vpn in range {
+            self.page_table.unmap(vpn);
+            self.mmap_frames.remove(&vpn);
+        }
+        true
+    }
+
+    fn mmap_range(start: usize, len: usize) -> Option<VPNRange> {
+        const USER_END: usize = 1usize << 38;
+        let end = start.checked_add(len)?;
+        if start % PAGE_SIZE != 0 || start >= USER_END || end > USER_END {
+            return None;
+        }
+        Some(VPNRange::new(
+            VirtAddr::from(start).floor(),
+            VirtAddr::from(end).ceil(),
+        ))
+    }
+
     /// shrink the area to new_end
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {

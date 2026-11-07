@@ -193,6 +193,20 @@ pub fn current_user_token() -> usize {
     TASK_MANAGER.get_current_token()
 }
 
+/// Map pages in the current task's address space.
+pub(crate) fn mmap_current(start: usize, len: usize, prot: usize) -> bool {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current].memory_set.mmap(start, len, prot)
+}
+
+/// Unmap pages in the current task's address space.
+pub(crate) fn munmap_current(start: usize, len: usize) -> bool {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current].memory_set.munmap(start, len)
+}
+
 /// Get the current 'Running' task's trap contexts.
 pub fn current_trap_cx() -> &'static mut TrapContext {
     TASK_MANAGER.get_current_trap_cx()
@@ -201,4 +215,21 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+const SYSCALL_COUNT_LIMIT: usize = 512;
+
+/// Record a system call for the current task before dispatch.
+pub(crate) fn record_syscall(id: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    if let Some(count) = inner.tasks[current].syscall_counts.get_mut(id) {
+        *count += 1;
+    }
+}
+
+/// Read the current task's system call counter.
+pub(crate) fn current_syscall_count(id: usize) -> Option<usize> {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    inner.tasks[inner.current_task].syscall_counts.get(id).copied()
 }
