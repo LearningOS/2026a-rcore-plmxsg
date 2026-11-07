@@ -23,6 +23,8 @@ pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
 
+const SYSCALL_COUNT_SLOTS: usize = 512;
+
 /// The task manager, where all the tasks are managed.
 ///
 /// Functions implemented on `TaskManager` deals with all task state transitions
@@ -54,6 +56,7 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+            syscall_counts: [0; SYSCALL_COUNT_SLOTS],
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -135,6 +138,21 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+}
+
+/// Record a syscall for the current task before dispatching it.
+pub(crate) fn record_syscall(id: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    if let Some(count) = inner.tasks[current].syscall_counts.get_mut(id) {
+        *count = count.saturating_add(1);
+    }
+}
+
+/// Read the current task's count for a syscall number.
+pub(crate) fn current_syscall_count(id: usize) -> Option<u32> {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    inner.tasks[inner.current_task].syscall_counts.get(id).copied()
 }
 
 /// Run the first task in task list.

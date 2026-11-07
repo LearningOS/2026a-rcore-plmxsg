@@ -9,6 +9,8 @@ pub struct TaskControlBlock {
     pub task_status: TaskStatus,
     /// The task context
     pub task_cx: TaskContext,
+    /// System call counts for this task, indexed by syscall number.
+    pub(super) syscall_counts: [u32; super::SYSCALL_COUNT_SLOTS],
 }
 
 /// The status of a task
