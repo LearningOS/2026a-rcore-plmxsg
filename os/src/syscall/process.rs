@@ -151,34 +151,75 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    use crate::mm::{PTEFlags, PageTable, VirtAddr};
+    use crate::task::current_user_token;
+    use crate::timer::get_time_us;
+
+    trace!("kernel: sys_get_time");
+
+    let start = ts as usize;
+    if start == 0 {
+        return -1;
+    }
+
+    let now = get_time_us();
+    let sec = (now / 1_000_000).to_ne_bytes();
+    let usec = (now % 1_000_000).to_ne_bytes();
+
+    let page_table = PageTable::from_token(current_user_token());
+    let mut destinations = [core::ptr::null_mut::<u8>(); core::mem::size_of::<TimeVal>()];
+
+    for (offset, destination) in destinations.iter_mut().enumerate() {
+        let Some(addr) = start.checked_add(offset) else {
+            return -1;
+        };
+        // Sv39 要求地址的高位是第 38 位的符号扩展。
+        if (((addr << 25) as isize) >> 25) as usize != addr {
+            return -1;
+        }
+
+        let va = VirtAddr::from(addr);
+        let Some(pte) = page_table.translate(va.floor()) else {
+            return -1;
+        };
+        if !pte.flags().contains(PTEFlags::V | PTEFlags::U | PTEFlags::W) {
+            return -1;
+        }
+        *destination = pte.ppn().get_bytes_array().as_mut_ptr().wrapping_add(va.page_offset());
+    }
+
+    for (destination, byte) in destinations.into_iter().zip(sec.into_iter().chain(usec)) {
+        // 上面已验证该地址位于当前任务有效、可写的用户页。
+        unsafe { destination.write(byte) };
+    }
+    0
 }
 
 /// mmap syscall
 ///
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    let task = current_process();
+    let mut inner = task.inner_exclusive_access();
+    if inner.memory_set.mmap(start, len, prot) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// munmap syscall
 ///
 /// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    let task = current_process();
+    let mut inner = task.inner_exclusive_access();
+    if inner.memory_set.munmap(start, len) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -193,21 +234,27 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
 /// spawn syscall
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+pub fn sys_spawn(path: *const u8) -> isize {
+    let path = translated_str(current_user_token(), path);
+    let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) else {
+        return -1;
+    };
+    let data = app_inode.read_all();
+    let parent = current_process();
+    let child = crate::task::ProcessControlBlock::new(data.as_slice());
+    child.inner_exclusive_access().parent = Some(Arc::downgrade(&parent));
+    let pid = child.getpid();
+    parent.inner_exclusive_access().children.push(child);
+    pid as isize
 }
 
 /// set priority syscall
 ///
 /// YOUR JOB: Set task priority
-pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+pub fn sys_set_priority(prio: isize) -> isize {
+    if prio < 2 {
+        return -1;
+    }
+    current_task().unwrap().inner_exclusive_access().priority = prio as usize;
+    prio
 }

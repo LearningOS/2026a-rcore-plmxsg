@@ -8,6 +8,11 @@ use crate::mm::UserBuffer;
 
 /// trait File for all file types
 pub trait File: Send + Sync {
+    /// Metadata is available for files backed by a filesystem inode.
+    fn stat(&self) -> Option<Stat> {
+        None
+    }
+
     /// the file readable?
     fn readable(&self) -> bool;
     /// the file writable?
@@ -34,6 +39,18 @@ pub struct Stat {
     pad: [u64; 7],
 }
 
+impl Stat {
+    /// Encode the C-layout user ABI with an explicitly zeroed reserved field.
+    pub(crate) fn to_bytes(&self) -> [u8; core::mem::size_of::<Self>()] {
+        let mut bytes = [0; core::mem::size_of::<Self>()];
+        bytes[0..8].copy_from_slice(&self.dev.to_ne_bytes());
+        bytes[8..16].copy_from_slice(&self.ino.to_ne_bytes());
+        bytes[16..20].copy_from_slice(&self.mode.bits().to_ne_bytes());
+        bytes[20..24].copy_from_slice(&self.nlink.to_ne_bytes());
+        bytes
+    }
+}
+
 bitflags! {
     /// The mode of a inode
     /// whether a directory or a file
@@ -48,5 +65,6 @@ bitflags! {
 }
 
 pub use inode::{list_apps, open_file, OSInode, OpenFlags};
+pub(crate) use inode::ROOT_INODE;
 pub use pipe::{make_pipe, Pipe};
 pub use stdio::{Stdin, Stdout};

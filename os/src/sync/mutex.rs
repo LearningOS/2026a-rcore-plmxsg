@@ -4,7 +4,7 @@ use super::UPSafeCell;
 use crate::task::TaskControlBlock;
 use crate::task::{block_current_and_run_next, suspend_current_and_run_next};
 use crate::task::{current_task, wakeup_task};
-use alloc::{collections::VecDeque, sync::Arc};
+use alloc::{collections::VecDeque, sync::{Arc, Weak}};
 
 /// Mutex trait
 pub trait Mutex: Sync + Send {
@@ -12,18 +12,20 @@ pub trait Mutex: Sync + Send {
     fn lock(&self);
     /// Unlock the mutex
     fn unlock(&self);
+    /// Current owner, including a thread granted a blocking lock.
+    fn owner(&self) -> Option<Arc<TaskControlBlock>>;
 }
 
 /// Spinlock Mutex struct
 pub struct MutexSpin {
-    locked: UPSafeCell<bool>,
+    locked: UPSafeCell<Option<Weak<TaskControlBlock>>>,
 }
 
 impl MutexSpin {
     /// Create a new spinlock mutex
     pub fn new() -> Self {
         Self {
-            locked: unsafe { UPSafeCell::new(false) },
+            locked: unsafe { UPSafeCell::new(None) },
         }
     }
 }
@@ -34,12 +36,12 @@ impl Mutex for MutexSpin {
         trace!("kernel: MutexSpin::lock");
         loop {
             let mut locked = self.locked.exclusive_access();
-            if *locked {
+            if locked.is_some() {
                 drop(locked);
                 suspend_current_and_run_next();
                 continue;
             } else {
-                *locked = true;
+                *locked = Some(Arc::downgrade(&current_task().unwrap()));
                 return;
             }
         }
@@ -48,7 +50,11 @@ impl Mutex for MutexSpin {
     fn unlock(&self) {
         trace!("kernel: MutexSpin::unlock");
         let mut locked = self.locked.exclusive_access();
-        *locked = false;
+        *locked = None;
+    }
+
+    fn owner(&self) -> Option<Arc<TaskControlBlock>> {
+        self.locked.exclusive_access().as_ref().and_then(Weak::upgrade)
     }
 }
 
@@ -59,6 +65,7 @@ pub struct MutexBlocking {
 
 pub struct MutexBlockingInner {
     locked: bool,
+    owner: Option<Weak<TaskControlBlock>>,
     wait_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
@@ -70,6 +77,7 @@ impl MutexBlocking {
             inner: unsafe {
                 UPSafeCell::new(MutexBlockingInner {
                     locked: false,
+                    owner: None,
                     wait_queue: VecDeque::new(),
                 })
             },
@@ -88,6 +96,7 @@ impl Mutex for MutexBlocking {
             block_current_and_run_next();
         } else {
             mutex_inner.locked = true;
+            mutex_inner.owner = Some(Arc::downgrade(&current_task().unwrap()));
         }
     }
 
@@ -97,9 +106,15 @@ impl Mutex for MutexBlocking {
         let mut mutex_inner = self.inner.exclusive_access();
         assert!(mutex_inner.locked);
         if let Some(waking_task) = mutex_inner.wait_queue.pop_front() {
+            mutex_inner.owner = Some(Arc::downgrade(&waking_task));
             wakeup_task(waking_task);
         } else {
             mutex_inner.locked = false;
+            mutex_inner.owner = None;
         }
+    }
+
+    fn owner(&self) -> Option<Arc<TaskControlBlock>> {
+        self.inner.exclusive_access().owner.as_ref().and_then(Weak::upgrade)
     }
 }

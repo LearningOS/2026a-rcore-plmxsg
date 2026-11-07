@@ -1,5 +1,5 @@
-use crate::fs::{make_pipe, open_file, OpenFlags, Stat};
-use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
+use crate::fs::{make_pipe, open_file, OpenFlags, Stat, ROOT_INODE};
+use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, PTEFlags, PageTable, UserBuffer, VirtAddr};
 use crate::task::{current_process, current_task, current_user_token};
 use alloc::sync::Arc;
 /// write syscall
@@ -123,29 +123,69 @@ pub fn sys_dup(fd: usize) -> isize {
     new_fd as isize
 }
 
-/// YOUR JOB: Implement fstat.
-pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+// ChatGPT assisted with porting filesystem syscalls to ch8.
+fn user_byte(table: &PageTable, address: usize, permission: PTEFlags) -> Option<*mut u8> {
+    if address == 0 || address >= (1usize << 38) {
+        return None;
+    }
+    let va = VirtAddr::from(address);
+    let pte = table.translate(va.floor())?;
+    if !pte.flags().contains(PTEFlags::V | PTEFlags::U | permission) {
+        return None;
+    }
+    Some(pte.ppn().get_bytes_array().as_mut_ptr().wrapping_add(va.page_offset()))
 }
 
-/// YOUR JOB: Implement linkat.
-pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+fn user_name(ptr: *const u8) -> Option<alloc::string::String> {
+    let table = PageTable::from_token(current_user_token());
+    let mut bytes = [0u8; 28];
+    for (offset, byte) in bytes.iter_mut().enumerate() {
+        let address = (ptr as usize).checked_add(offset)?;
+        *byte = unsafe { user_byte(&table, address, PTEFlags::R)?.read() };
+        if *byte == 0 {
+            return core::str::from_utf8(&bytes[..offset]).ok().map(Into::into);
+        }
+    }
+    None
 }
 
-/// YOUR JOB: Implement unlinkat.
-pub fn sys_unlinkat(_name: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
+    let task = current_process();
+    let file = {
+        let inner = task.inner_exclusive_access();
+        inner.fd_table.get(fd).and_then(|slot| slot.as_ref()).cloned()
+    };
+    let Some(stat) = file.and_then(|file| file.stat()) else {
+        return -1;
+    };
+    let table = PageTable::from_token(current_user_token());
+    let bytes = stat.to_bytes();
+    let mut destinations = [core::ptr::null_mut::<u8>(); core::mem::size_of::<Stat>()];
+    for (offset, destination) in destinations.iter_mut().enumerate() {
+        let Some(address) = (st as usize).checked_add(offset) else {
+            return -1;
+        };
+        let Some(ptr) = user_byte(&table, address, PTEFlags::W) else {
+            return -1;
+        };
+        *destination = ptr;
+    }
+    for (destination, byte) in destinations.into_iter().zip(bytes) {
+        unsafe { destination.write(byte) };
+    }
+    0
+}
+
+pub fn sys_linkat(old_name: *const u8, new_name: *const u8) -> isize {
+    let (Some(old), Some(new)) = (user_name(old_name), user_name(new_name)) else {
+        return -1;
+    };
+    if ROOT_INODE.link(&old, &new) { 0 } else { -1 }
+}
+
+pub fn sys_unlinkat(name: *const u8) -> isize {
+    let Some(name) = user_name(name) else {
+        return -1;
+    };
+    if ROOT_INODE.unlink(&name) { 0 } else { -1 }
 }
